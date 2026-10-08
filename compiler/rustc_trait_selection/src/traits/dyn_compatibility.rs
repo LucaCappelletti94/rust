@@ -7,6 +7,7 @@
 use std::ops::ControlFlow;
 
 use rustc_attr_ir::lang_items::LangItem;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::FatalError;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
@@ -750,13 +751,75 @@ fn receiver_is_dispatchable<'tcx>(
         clauses.push(trait_predicate.upcast(tcx));
 
         // U satisfies `Trait`'s where-bounds.
-        clauses.extend(
-            tcx.clauses_of(trait_def_id)
-                .instantiate(tcx, args)
-                .clauses
-                .into_iter()
-                .map(Unnormalized::skip_norm_wip),
-        );
+        let mut share_associated_values = false;
+        let trait_clauses = tcx.clauses_of(trait_def_id);
+        for ((original, _), (copied, _)) in
+            trait_clauses.instantiate_own_identity().zip(trait_clauses.instantiate_own(tcx, args))
+        {
+            let (original, copied) = (original.skip_norm_wip(), copied.skip_norm_wip());
+            if let (Some(orig), Some(copy)) =
+                (original.as_projection_clause(), copied.as_projection_clause())
+                && orig.map_bound(|p| p.projection_term) == copy.map_bound(|p| p.projection_term)
+                && orig.map_bound(|p| p.term) != copy.map_bound(|p| p.term)
+                && !contains_illegal_self_type_reference(
+                    tcx,
+                    trait_def_id,
+                    orig.map_bound(|p| p.term),
+                    AllowSelfProjections::Yes,
+                )
+            {
+                share_associated_values = true;
+            } else {
+                clauses.push(copied);
+            }
+        }
+
+        if share_associated_values {
+            let constrained_projections: FxHashSet<_> = elaborate(tcx, clauses.iter().copied())
+                .filter_map(|clause| clause.as_projection_clause())
+                .filter(|projection| {
+                    projection.skip_binder().projection_term.self_ty() == unsized_self_ty
+                })
+                .map(|projection| {
+                    tcx.anonymize_bound_vars(projection.map_bound(|p| p.projection_term))
+                })
+                .collect();
+
+            // Trait objects retain the associated values of `Self`.
+            for supertrait in util::supertraits(tcx, ty::Binder::dummy(trait_predicate)) {
+                for item in tcx.associated_items(supertrait.def_id()).in_definition_order() {
+                    if !item.can_have_equality_constraint(tcx)
+                        || item.is_impl_trait_in_trait()
+                        || !tcx.generics_of(item.def_id).is_own_empty()
+                        || tcx.generics_require_sized_self(item.def_id)
+                    {
+                        continue;
+                    }
+                    let kind = if item.is_type() {
+                        ty::AliasTermKind::ProjectionTy { def_id: item.def_id }
+                    } else {
+                        ty::AliasTermKind::ProjectionConst { def_id: item.def_id }
+                    };
+
+                    let projection = supertrait.map_bound(|trait_ref| {
+                        ty::AliasTerm::new_from_args(tcx, kind, trait_ref.args)
+                    });
+                    if constrained_projections.contains(&tcx.anonymize_bound_vars(projection)) {
+                        continue;
+                    }
+                    clauses.push(
+                        projection
+                            .map_bound(|projection_term| ty::ProjectionClause {
+                                projection_term,
+                                term: projection_term
+                                    .with_replaced_self_ty(tcx, tcx.types.self_param)
+                                    .to_term(tcx, ty::IsRigid::No),
+                            })
+                            .upcast(tcx),
+                    );
+                }
+            }
+        }
 
         let meta_sized_predicate = {
             let meta_sized_did = tcx.require_lang_item(LangItem::MetaSized, DUMMY_SP);
